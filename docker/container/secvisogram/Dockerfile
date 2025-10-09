@@ -1,7 +1,7 @@
 # Build Stage 1
 # This build created a staging docker image
 #
-FROM node:20-alpine AS build
+FROM node:22-alpine AS build
 WORKDIR /usr/src
 RUN apk add git; \
     git clone https://github.com/secvisogram/secvisogram.git; \
@@ -13,6 +13,6 @@ RUN apk add git; \
 # This build takes the production build from staging build
 #
 
-FROM nginx:1.23-alpine
+FROM nginx:1.27-alpine
 COPY --from=build /usr/src/secvisogram/app/dist /usr/share/nginx/html
 EXPOSE 80

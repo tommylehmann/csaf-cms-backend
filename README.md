@@ -127,26 +127,25 @@ only and should not be used in production.
 
 ```
 
-- run `docker compose up`
-- After Keycloak is up, open a second terminal window and run
-  `docker compose up keycloak-cli` to import a realm with all the users
-  and roles already set up.
+- run `docker compose up -d` in folder `docker`
 - To set up our CouchDB server open `http://127.0.0.1:5984/_utils/#/setup`
-  and run the [Single Node Setup](https://docs.couchdb.org/en/stable/setup/single-node.html). This creates databases like **_users** and stops CouchDB from spamming our logs (Admin credentials from .env)
+  and run the [Single Node Setup](https://docs.couchdb.org/en/stable/setup/single-node.html). This creates databases like **_users** and stops CouchDB from spamming our logs (Admin credentials from docker/.env)
 - Create a database in CouchDB with the name specified in `CSAF_COUCHDB_DBNAME`
-- Open `http://localhost:9000/` and log in with the admin user.
-    - The port is defined in .env - CSAF_KEYCLOAK_PORT, default 9000
+- run `docker compose up keycloak-setup` to initialize Keycloak.
+- Open `http://localhost:9000/` and log in with the admin user, that is specified in `CSAF_KEYCLOAK_ADMIN_USER` and `CSAF_KEYCLOAK_ADMIN_PASSWORD`.
+    - The port is defined in docker/.env - CSAF_KEYCLOAK_PORT, default 9000.
     - Select `CSAF`-Realm
     - On the left side, navigate to "Clients" and select the Secvisogram client.
     - Select the **Credentials** tab and copy the Secret. This is our
       `CSAF_CLIENT_SECRET` environment variable.
 - [Generate a cookie secret](https://oauth2-proxy.github.io/oauth2-proxy/configuration/overview#generating-a-cookie-secret)
   and paste it in `CSAF_COOKIE_SECRET`.
-- restart compose
+- restart `docker compose down` and `docker compose up -d`
 - (required for exports) install [pandoc (tested with version 2.18)](https://pandoc.org/installing.html)
   as well as [weasyprint (tested with version 56.0)](https://weasyprint.org/) and make sure both are in
   your PATH
 - (optional for exports) define the path to a company logo that should be used in the exports through the environment variable `CSAF_COMPANY_LOGO_PATH`. The path can either be relative to the project root or absolute. See .env.example file for an example.
+- start CSAF-CMS-Backend with `./mvnw spring-boot:run`
 
 You should now be able to start the spring boot application, navigate to
 `http://localhost/api/v1/about`, log in with one of the users and get a
