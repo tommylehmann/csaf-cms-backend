@@ -93,11 +93,12 @@ export function renderWithMustache(template, json, logo) {
     if (logo) {
         obj['logo'] = JSON.parse(logo);
     }
-    print(JSON.stringify(obj, null, 2))
+    // preview() deep-clones its argument and returns the extended copy, so the
+    // rendered document must be the returned doc.document (not the untouched obj).
+    // The logo set on obj above is carried into the clone, so it still renders.
     const documentEntity = new DocumentEntity();
     const doc = documentEntity.preview(obj);
-    print(doc.document.title)
-    return Mustache.render(template, obj, {
+    return Mustache.render(template, doc.document, {
     product_status_header: PRODUCT_STATUS_HEADER,
     product_status_row: PRODUCT_STATUS_ROW,
     remediation: REMEDIATION,
