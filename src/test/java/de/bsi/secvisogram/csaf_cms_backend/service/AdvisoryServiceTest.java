@@ -20,6 +20,9 @@ import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.startsWith;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
@@ -32,6 +35,7 @@ import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.time.Instant;
+import java.time.LocalDate;
 import java.time.format.DateTimeFormatter;
 import java.time.temporal.ChronoUnit;
 import java.util.Arrays;
@@ -515,8 +519,9 @@ public class AdvisoryServiceTest {
     public void changeAdvisoryWorkflowStateTest() throws IOException, DatabaseException, CsafException {
         IdAndRevision idRev = advisoryService.addAdvisory(csafToRequest(csafJson));
         advisoryService.changeAdvisoryWorkflowState(idRev.getId(), idRev.getRevision(), WorkflowState.Review, null, null);
-        // an advisory, 1 counter and 2 audit trails are created
-        assertEquals(4, advisoryService.getDocumentCount());
+        // an advisory, 2 counters (TMP + FINAL) and 2 audit trails are created;
+        // the FINAL counter is now drawn at the first Draft-to-Review transition
+        assertEquals(5, advisoryService.getDocumentCount());
         AdvisoryResponse advisory = advisoryService.getAdvisory(idRev.getId());
         assertEquals(WorkflowState.Review, advisory.getWorkflowState());
     }
@@ -683,10 +688,17 @@ public class AdvisoryServiceTest {
 
             IdAndRevision idRev = advisoryService.addAdvisory(csafToRequest(csafJson));
             String revision = advisoryService.changeAdvisoryWorkflowState(idRev.getId(), idRev.getRevision(), WorkflowState.Review, null, null);
+            // AC1 (Task 5.1): final-form id is already set right after the first Review.
+            String trackingIdAtReview = advisoryService.getAdvisory(idRev.getId()).getDocumentTrackingId();
+            assertFalse(trackingIdAtReview.contains("-TEMP-"),
+                    "id must be in final form after the first Review, not still temporary");
             revision = advisoryService.changeAdvisoryWorkflowState(idRev.getId(), revision, WorkflowState.Approved, null, null);
             revision = advisoryService.changeAdvisoryWorkflowState(idRev.getId(), revision, WorkflowState.RfPublication, null, null);
             revision = advisoryService.changeAdvisoryWorkflowState(idRev.getId(), revision, WorkflowState.Published, null, null);
             String trackingId = advisoryService.getAdvisory(idRev.getId()).getDocumentTrackingId();
+            // The id must not change between Review and Publish (same sequential number).
+            assertEquals(trackingIdAtReview, trackingId,
+                    "id at Publish must have the same sequential number as the id assigned at Review");
             advisoryService.createNewCsafDocumentVersion(idRev.getId(), revision);
             AdvisoryResponse advisory = advisoryService.getAdvisory(idRev.getId());
             assertEquals(WorkflowState.Draft, advisory.getWorkflowState(), "new document version should be in draft state");
@@ -706,10 +718,17 @@ public class AdvisoryServiceTest {
 
             IdAndRevision idRev = advisoryService.addAdvisory(csafToRequest(csafJson));
             String revision = advisoryService.changeAdvisoryWorkflowState(idRev.getId(), idRev.getRevision(), WorkflowState.Review, null, null);
+            // AC1 (Task 5.1): final-form id is already set right after the first Review.
+            String trackingIdAtFirstReview = advisoryService.getAdvisory(idRev.getId()).getDocumentTrackingId();
+            assertFalse(trackingIdAtFirstReview.contains("-TEMP-"),
+                    "id must be in final form after the first Review, not still temporary");
             revision = advisoryService.changeAdvisoryWorkflowState(idRev.getId(), revision, WorkflowState.Approved, null, null);
             revision = advisoryService.changeAdvisoryWorkflowState(idRev.getId(), revision, WorkflowState.RfPublication, null, null);
             revision = advisoryService.changeAdvisoryWorkflowState(idRev.getId(), revision, WorkflowState.Published, null, null);
             String trackingId = advisoryService.getAdvisory(idRev.getId()).getDocumentTrackingId();
+            // The sequential number must be the same at Review and at Publish.
+            assertEquals(trackingIdAtFirstReview, trackingId,
+                    "id at Publish must have the same sequential number as the id assigned at first Review");
             revision = advisoryService.createNewCsafDocumentVersion(idRev.getId(), revision);
             AdvisoryResponse advisoryFirstPublish = advisoryService.getAdvisory(idRev.getId());
             assertEquals(trackingId, advisoryFirstPublish.getDocumentTrackingId(), "new version of document should get same tracking ID");
@@ -1354,6 +1373,276 @@ public class AdvisoryServiceTest {
 
         List<AdvisoryInformationResponse> infos = this.advisoryService.getAdvisoryInformations(null);
         assertEquals(300, infos.size());
+    }
+
+    // --- Task 5: new tracking-id reservation tests ---
+
+    @Test
+    @WithMockUser(username = "editor1", authorities = {CsafRoles.ROLE_AUTHOR, CsafRoles.ROLE_EDITOR, CsafRoles.ROLE_REVIEWER})
+    @SuppressFBWarnings(value = "RCN_REDUNDANT_NULLCHECK_WOULD_HAVE_BEEN_A_NPE",
+            justification = "Bug in SpotBugs: https://github.com/spotbugs/spotbugs/issues/1338")
+    public void reserveTrackingIdAtReviewTest() throws IOException, DatabaseException, CsafException {
+        // AC1: first Draft-to-Review draws the FINAL counter once and sets COMPANY-YEAR-NNNNN.
+        // The test class uses csaf.trackingid.company="" and csaf.trackingid.digits=7.
+        // With no publisher name the company segment is ""; seq=1 → id "-<year>-0000001".
+        int currentYear = LocalDate.now().getYear();
+        String expectedIdPattern = "-" + currentYear + "-0000001";
+
+        IdAndRevision idRev = advisoryService.addAdvisory(csafToRequest(csafJson));
+        advisoryService.changeAdvisoryWorkflowState(idRev.getId(), idRev.getRevision(), WorkflowState.Review, null, null);
+
+        AdvisoryResponse advisory = advisoryService.getAdvisory(idRev.getId());
+        String idAfterReview = advisory.getDocumentTrackingId();
+
+        // The id is now in final form (no -TEMP-).
+        assertFalse(idAfterReview.contains("-TEMP-"),
+                "id must not be temporary after first Review");
+        assertEquals(expectedIdPattern, idAfterReview,
+                "id must be COMPANY-YEAR-NNNNN after first Review");
+
+        // FINAL counter advanced exactly once to 1.
+        long finalCounter = advisoryService.getNewTrackingIdCounter(TrackingIdCounter.FINAL_OBJECT_ID);
+        assertEquals(2L, finalCounter,
+                "FINAL counter must be 2 (the one drawn at review was 1; this call draws 2)");
+
+        // No self-reference URL yet (csaf.references.baseurl is blank in this test class).
+        assertTrue(advisory.getCsaf().at("/document/references").isMissingNode()
+                        || advisory.getCsaf().at("/document/references").isEmpty(),
+                "no self-reference URL node must exist after Review (URL is only added at Publish)");
+    }
+
+    @Test
+    @WithMockUser(username = "editor1", authorities = {CsafRoles.ROLE_AUTHOR, CsafRoles.ROLE_EDITOR, CsafRoles.ROLE_REVIEWER, CsafRoles.ROLE_PUBLISHER})
+    @SuppressFBWarnings(value = "RCN_REDUNDANT_NULLCHECK_WOULD_HAVE_BEEN_A_NPE",
+            justification = "Bug in SpotBugs: https://github.com/spotbugs/spotbugs/issues/1338")
+    public void publishReusesReservedNumberTest() throws IOException, DatabaseException, CsafException {
+        // AC2: Publish reuses the reserved number; FINAL counter advances only once total.
+        try (final MockedStatic<ValidatorServiceClient> validatorMock = Mockito.mockStatic(ValidatorServiceClient.class)) {
+
+            validatorMock.when(() -> ValidatorServiceClient.isAdvisoryValid(any(), any())).thenReturn(Boolean.TRUE);
+
+            IdAndRevision idRev = advisoryService.addAdvisory(csafToRequest(csafJson));
+            String revision = advisoryService.changeAdvisoryWorkflowState(idRev.getId(), idRev.getRevision(), WorkflowState.Review, null, null);
+
+            // Extract the NNNNN segment from the id set at Review.
+            String idAtReview = advisoryService.getAdvisory(idRev.getId()).getDocumentTrackingId();
+            assertFalse(idAtReview.contains("-TEMP-"), "id at Review must not be temporary");
+
+            // Advance through to Publish without asserting counter here (we'll check it after).
+            revision = advisoryService.changeAdvisoryWorkflowState(idRev.getId(), revision, WorkflowState.Approved, null, null);
+            revision = advisoryService.changeAdvisoryWorkflowState(idRev.getId(), revision, WorkflowState.RfPublication, null, null);
+            advisoryService.changeAdvisoryWorkflowState(idRev.getId(), revision, WorkflowState.Published, null, null);
+
+            AdvisoryResponse published = advisoryService.getAdvisory(idRev.getId());
+            String idAtPublish = published.getDocumentTrackingId();
+
+            // The sequential NNNNN must be the same as the one reserved at Review.
+            // Both ids end with the same "-0000001" segment (year may differ only if the test
+            // runs across a year boundary, which is accepted per spec).
+            String nnnnAtReview = idAtReview.substring(idAtReview.lastIndexOf('-'));
+            String nnnnAtPublish = idAtPublish.substring(idAtPublish.lastIndexOf('-'));
+            assertEquals(nnnnAtReview, nnnnAtPublish,
+                    "sequential NNNNN must be identical at Review and at Publish");
+
+            // The FINAL counter must have advanced exactly once in total (the one draw at Review).
+            // Calling getNewTrackingIdCounter now draws the next value, which must be 2.
+            long nextFinal = advisoryService.getNewTrackingIdCounter(TrackingIdCounter.FINAL_OBJECT_ID);
+            assertEquals(2L, nextFinal,
+                    "FINAL counter must be 2 after a full Review-to-Publish cycle (no double draw)");
+        }
+    }
+
+    @Test
+    @WithMockUser(username = "editor1", authorities = {CsafRoles.ROLE_AUTHOR, CsafRoles.ROLE_EDITOR, CsafRoles.ROLE_REVIEWER})
+    @SuppressFBWarnings(value = "RCN_REDUNDANT_NULLCHECK_WOULD_HAVE_BEEN_A_NPE",
+            justification = "Bug in SpotBugs: https://github.com/spotbugs/spotbugs/issues/1338")
+    public void reReviewDoesNotRedrawTest() throws IOException, DatabaseException, CsafException {
+        // AC3: Draft→Review→Draft→Review draws the FINAL counter exactly once; id is unchanged
+        // on the second review.
+        IdAndRevision idRev = advisoryService.addAdvisory(csafToRequest(csafJson));
+
+        // First review — reserves the number.
+        String revision = advisoryService.changeAdvisoryWorkflowState(idRev.getId(), idRev.getRevision(), WorkflowState.Review, null, null);
+        String idAfterFirstReview = advisoryService.getAdvisory(idRev.getId()).getDocumentTrackingId();
+        assertFalse(idAfterFirstReview.contains("-TEMP-"), "id must be final-form after first Review");
+
+        // Back to Draft (rejection).
+        revision = advisoryService.changeAdvisoryWorkflowState(idRev.getId(), revision, WorkflowState.Draft, null, null);
+
+        // Second review — must NOT redraw.
+        advisoryService.changeAdvisoryWorkflowState(idRev.getId(), revision, WorkflowState.Review, null, null);
+        String idAfterSecondReview = advisoryService.getAdvisory(idRev.getId()).getDocumentTrackingId();
+
+        // The id must be identical: same company, same year, same NNNNN.
+        assertEquals(idAfterFirstReview, idAfterSecondReview,
+                "id must be identical after the second Review (assign-once guard)");
+
+        // FINAL counter advanced exactly once. The next draw returns 2.
+        long nextFinal = advisoryService.getNewTrackingIdCounter(TrackingIdCounter.FINAL_OBJECT_ID);
+        assertEquals(2L, nextFinal,
+                "FINAL counter must be 2 after Draft-Review-Draft-Review (no redraw on re-review)");
+    }
+
+    @Test
+    @WithMockUser(username = "editor1", authorities = {CsafRoles.ROLE_AUTHOR, CsafRoles.ROLE_EDITOR, CsafRoles.ROLE_REVIEWER, CsafRoles.ROLE_PUBLISHER})
+    @SuppressFBWarnings(value = "RCN_REDUNDANT_NULLCHECK_WOULD_HAVE_BEEN_A_NPE",
+            justification = "Bug in SpotBugs: https://github.com/spotbugs/spotbugs/issues/1338")
+    public void rejectEditCycleDrawsTrackingNumberOnceTest() throws IOException, DatabaseException, CsafException {
+        // Regression for F1: updateAdvisory between first Review and Publish must not drop the
+        // reservedTrackingNumber, which would force publish into the legacy fallback and draw a
+        // second FINAL counter value.
+        //
+        // Flow: create → Review (reserves FINAL#1) → Draft → updateAdvisory (modified body)
+        //       → Review → Approved → RfPublication → Published.
+        // Expected: FINAL counter advanced exactly once; NNNNN at Publish equals NNNNN at Review.
+        try (final MockedStatic<ValidatorServiceClient> validatorMock = Mockito.mockStatic(ValidatorServiceClient.class)) {
+
+            validatorMock.when(() -> ValidatorServiceClient.isAdvisoryValid(any(), any())).thenReturn(Boolean.TRUE);
+
+            IdAndRevision idRev = advisoryService.addAdvisory(csafToRequest(csafJson));
+
+            // First Review — reserves FINAL number 1; id becomes COMPANY-YEAR-0000001.
+            String revision = advisoryService.changeAdvisoryWorkflowState(
+                    idRev.getId(), idRev.getRevision(), WorkflowState.Review, null, null);
+            String idAtFirstReview = advisoryService.getAdvisory(idRev.getId()).getDocumentTrackingId();
+            assertFalse(idAtFirstReview.contains("-TEMP-"), "id must be final-form after first Review");
+
+            // Extract the NNNNN suffix reserved at the first Review.
+            String nnnnAtReview = idAtFirstReview.substring(idAtFirstReview.lastIndexOf('-'));
+
+            // Reviewer rejects — back to Draft.
+            revision = advisoryService.changeAdvisoryWorkflowState(
+                    idRev.getId(), revision, WorkflowState.Draft, null, null);
+
+            // Editor updates the CSAF body (simulates the author fixing issues after rejection).
+            AdvisoryResponse draftAdvisory = advisoryService.getAdvisory(idRev.getId());
+            ((ObjectNode) draftAdvisory.getCsaf().at("/document")).put("title", "Fixed Title");
+            CreateAdvisoryRequest updateRequest = csafToRequest(draftAdvisory.getCsaf().toPrettyString());
+            updateRequest.setSummary("Fix after rejection");
+            revision = advisoryService.updateAdvisory(idRev.getId(), revision, updateRequest);
+
+            // Second Review — the reservedTrackingNumber must survive the update; no second draw.
+            revision = advisoryService.changeAdvisoryWorkflowState(
+                    idRev.getId(), revision, WorkflowState.Review, null, null);
+
+            // Proceed to Publish.
+            revision = advisoryService.changeAdvisoryWorkflowState(
+                    idRev.getId(), revision, WorkflowState.Approved, null, null);
+            revision = advisoryService.changeAdvisoryWorkflowState(
+                    idRev.getId(), revision, WorkflowState.RfPublication, null, null);
+            advisoryService.changeAdvisoryWorkflowState(
+                    idRev.getId(), revision, WorkflowState.Published, null, null);
+
+            String idAtPublish = advisoryService.getAdvisory(idRev.getId()).getDocumentTrackingId();
+            String nnnnAtPublish = idAtPublish.substring(idAtPublish.lastIndexOf('-'));
+
+            // The sequential number must be the same at Publish as it was at the first Review.
+            assertEquals(nnnnAtReview, nnnnAtPublish,
+                    "NNNNN segment must be identical at Publish and at the first Review (no second draw)");
+
+            // FINAL counter must have advanced exactly once in total.
+            // The next draw returns 2; if the bug were present it would return 3.
+            long nextFinal = advisoryService.getNewTrackingIdCounter(TrackingIdCounter.FINAL_OBJECT_ID);
+            assertEquals(2L, nextFinal,
+                    "FINAL counter must be 2 after the full reject-edit-publish cycle (single draw at first Review)");
+        }
+    }
+
+    @Test
+    @WithMockUser(username = "editor1", authorities = {CsafRoles.ROLE_AUTHOR, CsafRoles.ROLE_EDITOR, CsafRoles.ROLE_REVIEWER})
+    @SuppressFBWarnings(value = "RCN_REDUNDANT_NULLCHECK_WOULD_HAVE_BEEN_A_NPE",
+            justification = "Bug in SpotBugs: https://github.com/spotbugs/spotbugs/issues/1338")
+    public void craftedTempIdCannotForceSecondDrawTest() throws IOException, DatabaseException, CsafException {
+        // Regression for F2: the assign-once guard must key on the server-owned
+        // getReservedTrackingNumber() == null, not on the client-controllable tracking id string.
+        // An editor in Draft state could submit a CSAF body with an id containing "-TEMP-" to
+        // make hasTemporaryTrackingId() return true and trigger a second counter draw on
+        // the next Review transition.
+        //
+        // Flow: create → Review (counter = 1) → Draft
+        //       → updateAdvisory (CSAF with "-TEMP-" in /document/tracking/id) → Review.
+        // Expected: FINAL counter still at 1 (next draw returns 2); no second reservation.
+        IdAndRevision idRev = advisoryService.addAdvisory(csafToRequest(csafJson));
+
+        // First Review — reserves FINAL number 1.
+        String revision = advisoryService.changeAdvisoryWorkflowState(
+                idRev.getId(), idRev.getRevision(), WorkflowState.Review, null, null);
+        String idAtFirstReview = advisoryService.getAdvisory(idRev.getId()).getDocumentTrackingId();
+        assertFalse(idAtFirstReview.contains("-TEMP-"), "id must be final-form after first Review");
+
+        // Reviewer rejects — back to Draft.
+        revision = advisoryService.changeAdvisoryWorkflowState(
+                idRev.getId(), revision, WorkflowState.Draft, null, null);
+
+        // Craft a CSAF body that injects "-TEMP-" into the tracking id field.
+        // This is the attack described in F2: the editor submits a document whose
+        // /document/tracking/id contains "-TEMP-" hoping to fool the assign-once guard.
+        String craftedCsaf = """
+                {
+                    "document": {
+                        "category": "CSAF_BASE",
+                        "tracking": {
+                            "id": "ACME-TEMP-99999"
+                        }
+                    }
+                }""";
+        CreateAdvisoryRequest craftedRequest = csafToRequest(craftedCsaf);
+        craftedRequest.setSummary("Crafted update with fake TEMP id");
+        revision = advisoryService.updateAdvisory(idRev.getId(), revision, craftedRequest);
+
+        // Second Review — guard is getReservedTrackingNumber() == null (server-owned), so
+        // the crafted "-TEMP-" in the CSAF body must NOT trigger a second draw.
+        advisoryService.changeAdvisoryWorkflowState(
+                idRev.getId(), revision, WorkflowState.Review, null, null);
+
+        // FINAL counter must still be at 1; the next draw returns 2.
+        long nextFinal = advisoryService.getNewTrackingIdCounter(TrackingIdCounter.FINAL_OBJECT_ID);
+        assertEquals(2L, nextFinal,
+                "FINAL counter must be 2 — crafted '-TEMP-' id must not have triggered a second draw");
+    }
+
+    @Test
+    @SuppressFBWarnings(value = "CE_CLASS_ENVY", justification = "Only for Test")
+    public void publishLegacyTempIdDrawsFreshNumberTest() throws IOException, CsafException {
+        // AC4: an advisory still holding a TEMP id at Publish (no reserved number — legacy path)
+        // must use drawAndAssignFinalTrackingIdAndUrl, which draws a fresh FINAL number.
+        // There is no public API path to reach Publish from a TEMP id in the current workflow
+        // (the Review transition would intercept first), so this case is exercised at the
+        // wrapper level, which is where the implementation lives.
+        var csafJsonWithPublisher = """
+                { "document": {
+                      "publisher": {
+                         "name": "Legacy Corp"
+                      }
+                   }
+                }""";
+
+        AdvisoryWrapper advisory = AdvisoryWrapper.createNewFromCsaf(
+                csafToRequest(csafJsonWithPublisher), "Mustermann", de.bsi.secvisogram.csaf_cms_backend.json.VersioningType.Semantic.name());
+
+        // Set a TEMP id exactly as addAdvisory would.
+        advisory.setTemporaryTrackingId("legacy", "5", 7L);
+        assertTrue(advisory.hasTemporaryTrackingId(), "advisory must have a TEMP id before the call");
+        assertNull(advisory.getReservedTrackingNumber(), "reserved number must be absent before any reservation");
+
+        // drawAndAssignFinalTrackingIdAndUrl is the legacy one-shot method — mirrors setFinalTrackingIdAndUrl.
+        long freshNumber = 42L;
+        advisory.drawAndAssignFinalTrackingIdAndUrl("", "legacy", "5", freshNumber);
+
+        // After the call the id is in final-form with the fresh number.
+        String trackingId = advisory.getDocumentTrackingId();
+        assertFalse(advisory.hasTemporaryTrackingId(),
+                "hasTemporaryTrackingId must be false after drawAndAssignFinalTrackingIdAndUrl");
+        assertNotNull(advisory.getReservedTrackingNumber(),
+                "reservedTrackingNumber must be set after drawAndAssignFinalTrackingIdAndUrl");
+        assertEquals(freshNumber, advisory.getReservedTrackingNumber(),
+                "reservedTrackingNumber must equal the freshly drawn number");
+        // The id must end with the formatted fresh number ("00042" for digits=5).
+        assertTrue(trackingId.endsWith("-00042"),
+                "final id must embed the fresh number in the NNNNN position");
+        // The old TEMP id must have been stashed in the meta tmpTrackingId field (AC5).
+        assertEquals("legacy-TEMP-00007", advisory.getTempTrackingIdInFromMeta(),
+                "original TEMP id must be preserved in the tmpTrackingId meta field");
     }
 
 }

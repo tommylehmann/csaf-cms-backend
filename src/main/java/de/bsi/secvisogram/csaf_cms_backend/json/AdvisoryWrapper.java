@@ -238,6 +238,17 @@ public class AdvisoryWrapper {
             wrapper.setDocumentTrackingInitialReleaseDate(existing.getDocumentTrackingInitialReleaseDate());
         }
 
+        // Preserve server-owned meta fields that must survive an edit cycle.
+        // Without this a reject-edit cycle (Review → Draft → updateAdvisory → Review → Publish)
+        // would drop reservedTrackingNumber, causing publish to fall into the legacy branch and
+        // draw a second FINAL counter value for the same advisory (see security review F1).
+        if (existing.getTempTrackingIdInFromMeta() != null) {
+            wrapper.setTempTrackingIdInMeta(existing.getTempTrackingIdInFromMeta());
+        }
+        if (existing.getReservedTrackingNumber() != null) {
+            wrapper.setReservedTrackingNumber(existing.getReservedTrackingNumber());
+        }
+
         return wrapper;
     }
 
@@ -316,6 +327,50 @@ public class AdvisoryWrapper {
 
         this.advisoryNode.put(AdvisoryField.TMP_TRACKING_ID.getDbName(), tempTrackingId);
         return this;
+    }
+
+    /**
+     * Get the sequential number that was reserved from the FINAL counter at first review.
+     * Returns {@code null} when the field is absent (advisory predates the feature or has
+     * not yet entered review).
+     *
+     * @return the reserved number, or {@code null} if not yet set
+     */
+    public Long getReservedTrackingNumber() {
+
+        if (!this.advisoryNode.has(AdvisoryField.RESERVED_TRACKING_NUMBER.getDbName())) {
+            return null;
+        }
+        JsonNode node = this.advisoryNode.get(AdvisoryField.RESERVED_TRACKING_NUMBER.getDbName());
+        if (node.isNull()) {
+            return null;
+        }
+        return node.longValue();
+    }
+
+    /**
+     * Persist the sequential number reserved from the FINAL counter at first review.
+     *
+     * @param number the reserved sequential number
+     * @return this
+     */
+    public AdvisoryWrapper setReservedTrackingNumber(long number) {
+
+        this.advisoryNode.put(AdvisoryField.RESERVED_TRACKING_NUMBER.getDbName(), number);
+        return this;
+    }
+
+    /**
+     * Returns {@code true} when the document tracking id is still in its temporary
+     * form (contains {@code "-TEMP-"}). Used as the assign-once guard at review time:
+     * a non-temporary id means a number was already reserved and the reservation step
+     * must be skipped on re-review.
+     *
+     * @return true if the current tracking id is a TEMP id
+     */
+    public boolean hasTemporaryTrackingId() {
+
+        return getDocumentTrackingId().contains("-TEMP-");
     }
 
     public WorkflowState getWorkflowState() {
@@ -888,13 +943,17 @@ public class AdvisoryWrapper {
     }
 
     /**
-     * Set the final tracking id in the advisory and a DocumentReferencesNode with the url of the tracking id
-     * @param baseUrl the configured base url
-     * @param trackingIdCompany the configured company for the name of the tracking id
-     * @param trackingIdDigits the count of leading zeros to which the sequentialNumber is filled with
-     * @param sequentialNumber the next sequentialNumber
+     * Reserve the sequential tracking id number at first Draft-to-Review.
+     * Stashes the current (temporary) id into the {@code tmpTrackingId} meta field,
+     * builds the final-form id as {@code COMPANY-<reviewYear>-NNNNN} using the current
+     * year as a placeholder (publish will recompute the year from the initial release date),
+     * sets it on the document, and persists the reserved number for reuse at publish.
+     *
+     * @param trackingIdCompany the configured company short name
+     * @param trackingIdDigits  the count of digits (with leading zeros) for the sequential number
+     * @param sequentialNumber  the number drawn from the FINAL counter
      */
-    public void setFinalTrackingIdAndUrl(String baseUrl, String trackingIdCompany, String trackingIdDigits, long sequentialNumber) {
+    public void assignReservedTrackingId(String trackingIdCompany, String trackingIdDigits, long sequentialNumber) {
 
         setTempTrackingIdInMeta(getDocumentTrackingId());
 
@@ -904,10 +963,57 @@ public class AdvisoryWrapper {
         String trackingId = companyName + "-" + year + "-" + formatted;
         setDocumentTrackingId(trackingId);
 
+        setReservedTrackingNumber(sequentialNumber);
+    }
+
+    /**
+     * Finalize the tracking id year from the initial release date and add the self-reference URL.
+     * Called at publish when a number was already reserved at review. Reads the persisted
+     * {@code reservedTrackingNumber}, recomputes the year via {@link #calculatePublishYear()},
+     * rebuilds the id as {@code COMPANY-<publishYear>-NNNNN}, and appends the URL node.
+     *
+     * @param baseUrl           the configured base url (may be blank — URL is then skipped)
+     * @param trackingIdCompany the configured company short name
+     * @param trackingIdDigits  the count of digits (with leading zeros) for the sequential number
+     */
+    public void addSelfReferenceUrlAndFinalizeYear(String baseUrl, String trackingIdCompany, String trackingIdDigits) {
+
+        Long reservedBox = getReservedTrackingNumber();
+        if (reservedBox == null) {
+            // Programming error: callers must guard with getReservedTrackingNumber() != null before
+            // calling this method. Auto-unboxing a null Long here would produce a misleading NPE.
+            throw new IllegalStateException(
+                    "addSelfReferenceUrlAndFinalizeYear called with no reserved tracking number");
+        }
+        long reserved = reservedBox;
+        String companyName = calculateCompanyName(trackingIdCompany);
+        String formatted = formatNumber(trackingIdDigits, reserved);
+        int year = calculatePublishYear();
+        String trackingId = companyName + "-" + year + "-" + formatted;
+        setDocumentTrackingId(trackingId);
+
         if (baseUrl != null && !baseUrl.isBlank()) {
             String referenceUrl = calculateReferenceUrl(baseUrl, trackingId);
             this.addDocumentReferencesNode("URL generated by system", referenceUrl);
         }
+    }
+
+    /**
+     * Draw a fresh number and assign the final tracking id and URL in one step.
+     * This is the legacy/fallback path for advisories that reach Publish still holding a
+     * temporary id (no reserved number — e.g. created before this feature was deployed).
+     * Internally delegates to {@link #assignReservedTrackingId} then
+     * {@link #addSelfReferenceUrlAndFinalizeYear} so no logic is duplicated.
+     *
+     * @param baseUrl           the configured base url
+     * @param trackingIdCompany the configured company short name
+     * @param trackingIdDigits  the count of digits (with leading zeros) for the sequential number
+     * @param sequentialNumber  the freshly drawn number from the FINAL counter
+     */
+    public void drawAndAssignFinalTrackingIdAndUrl(String baseUrl, String trackingIdCompany, String trackingIdDigits, long sequentialNumber) {
+
+        assignReservedTrackingId(trackingIdCompany, trackingIdDigits, sequentialNumber);
+        addSelfReferenceUrlAndFinalizeYear(baseUrl, trackingIdCompany, trackingIdDigits);
     }
 
     /**
