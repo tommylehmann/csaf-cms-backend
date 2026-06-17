@@ -32,6 +32,7 @@ import de.bsi.secvisogram.csaf_cms_backend.model.DocumentTrackingStatus;
 import de.bsi.secvisogram.csaf_cms_backend.model.ExportFormat;
 import de.bsi.secvisogram.csaf_cms_backend.model.WorkflowState;
 import de.bsi.secvisogram.csaf_cms_backend.model.filter.AndExpression;
+import de.bsi.secvisogram.csaf_cms_backend.model.filter.Expression;
 import de.bsi.secvisogram.csaf_cms_backend.mustache.JavascriptExporter;
 import de.bsi.secvisogram.csaf_cms_backend.rest.request.CreateAdvisoryRequest;
 import de.bsi.secvisogram.csaf_cms_backend.rest.request.CreateCommentRequest;
@@ -115,37 +116,169 @@ public class AdvisoryService {
     public List<AdvisoryInformationResponse> getAdvisoryInformations(String expression) throws IOException, CsafException {
 
         Authentication credentials = getAuthentication();
-        List<AdvisoryInformationResponse> allAdvisories = readAllAdvisories(expression, ObjectType.Advisory);
+
+        Expression visibilityExpr = AdvisoryWorkflowUtil.buildVisibilityExpression(credentials);
+        // Visibility filtering is now pushed into the DB query via buildAdvisoryExpression(credentials).
+        List<AdvisoryInformationResponse> allAdvisories = readAllAdvisories(expression, ObjectType.Advisory, visibilityExpr);
         // set calculated fields in response
         for (AdvisoryInformationResponse response : allAdvisories) {
-            response.setDeletable(canDeleteAdvisory(response, credentials));
-            response.setChangeable(canChangeAdvisory(response, credentials));
-            response.setAllowedStateChanges(getAllowedStates(response, credentials));
-            response.setCanCreateVersion(canCreateNewVersion(response, credentials));
+            enrichAdvisory(response, credentials);
         }
-        List<AdvisoryInformationResponse> allResponses
-                = new ArrayList<>(allAdvisories
-                .stream()
-                .filter(response -> canViewAdvisory(response, credentials))
-                .toList());
+        List<AdvisoryInformationResponse> allResponses = new ArrayList<>(allAdvisories);
 
         if (hasRole(AUDITOR, credentials)) {
-            List<AdvisoryInformationResponse> allAdvisoryVersions = readAllAdvisories(expression, ObjectType.AdvisoryVersion);
+            List<AdvisoryInformationResponse> allAdvisoryVersions = readAllAdvisories(expression, ObjectType.AdvisoryVersion, null);
             for (AdvisoryInformationResponse response : allAdvisoryVersions) {
-                response.setDeletable(false);
-                response.setChangeable(false);
-                response.setAllowedStateChanges(emptyList());
-                response.setCanCreateVersion(false);
+                enrichAdvisoryVersion(response);
             }
             allResponses.addAll(allAdvisoryVersions);
         }
         return allResponses;
     }
 
-    private List<AdvisoryInformationResponse> readAllAdvisories(String expression, ObjectType objectType) throws CsafException, IOException {
+    /**
+     * Set the calculated fields of an advisory response, identical to the legacy
+     * {@link #getAdvisoryInformations(String)} advisory branch. Shared with the paged variant so
+     * both paths produce byte-identical elements.
+     *
+     * @param response    the advisory response to enrich
+     * @param credentials the credentials of the logged in user
+     */
+    private void enrichAdvisory(AdvisoryInformationResponse response, Authentication credentials) {
+        response.setDeletable(canDeleteAdvisory(response, credentials));
+        response.setChangeable(canChangeAdvisory(response, credentials));
+        response.setAllowedStateChanges(getAllowedStates(response, credentials));
+        response.setCanCreateVersion(canCreateNewVersion(response, credentials));
+    }
+
+    /**
+     * Set the calculated fields of an advisory version response, identical to the legacy
+     * {@link #getAdvisoryInformations(String)} auditor version branch.
+     *
+     * @param response the advisory version response to enrich
+     */
+    private void enrichAdvisoryVersion(AdvisoryInformationResponse response) {
+        response.setDeletable(false);
+        response.setChangeable(false);
+        response.setAllowedStateChanges(emptyList());
+        response.setCanCreateVersion(false);
+    }
+
+    /**
+     * Read one page of visible advisory information using cursor pagination.
+     * <p>
+     * Visibility is enforced inside the database query via
+     * {@link AdvisoryWorkflowUtil#buildVisibilityExpression(Authentication)} (issue #221): the Mango
+     * selector already excludes rows the caller may not see, so every raw row returned is visible and
+     * no in-memory {@code canViewAdvisory} filter is applied here. The pager merely slices that
+     * already-visible stream into pages and, for auditors, appends the
+     * {@link ObjectType#AdvisoryVersion} stream after the advisory stream. A read-ahead of one row
+     * computes {@code hasMore} authoritatively. The legacy {@link #getAdvisoryInformations(String)}
+     * path is left untouched and is not routed through this pager.
+     *
+     * @param expression the optional filter expression (unchanged grammar)
+     * @param limit      the maximum number of rows to emit in this page (1..1000)
+     * @param bookmark   the opaque cursor of the previous page, or {@code null} for the first page
+     * @return one page of visible advisory information with the next cursor and {@code hasMore}
+     * @throws CsafException with HTTP 400 if the cursor cannot be decoded or its fingerprint does not
+     *                       match {@code expression}
+     * @throws IOException   if reading from the database fails
+     */
+    @Secured({CsafRoles.ROLE_REGISTERED, CsafRoles.ROLE_AUDITOR})
+    public AdvisoryInformationPageResponse getAdvisoryInformationsPage(String expression, int limit,
+                                                                       @Nullable String bookmark)
+            throws IOException, CsafException {
+
+        Authentication credentials = getAuthentication();
+        boolean isAuditor = hasRole(AUDITOR, credentials);
+        String fingerprint = AdvisoryPageCursor.fingerprintOf(expression);
+        // Visibility is pushed into the DB query; null means the caller can see everything
+        // (AUDITOR/EDITOR). Advisory versions are never visibility-filtered (auditor-only stream).
+        Expression visibilityExpr = AdvisoryWorkflowUtil.buildVisibilityExpression(credentials);
+
+        AdvisoryPageCursor.Stream stream = AdvisoryPageCursor.Stream.ADVISORY;
+        String mangoBookmark = null;
+        int skipWithinPage = 0;
+        if (bookmark != null) {
+            AdvisoryPageCursor cursor = AdvisoryPageCursor.decode(bookmark, expression);
+            stream = cursor.getStream();
+            mangoBookmark = cursor.getMangoBookmark();
+            skipWithinPage = cursor.getSkipWithinPage();
+        }
+
+        // Accumulate up to limit + 1 rows (read-ahead of one) to derive hasMore.
+        List<AdvisoryInformationResponse> visible = new ArrayList<>(limit + 1);
+        // Position of the last emitted row within its raw Mango page, used to build the next cursor.
+        AdvisoryPageCursor.Stream cursorStream = stream;
+        String cursorMangoBookmark = mangoBookmark;
+        int cursorSkip = skipWithinPage;
+
+        while (visible.size() <= limit) {
+            Expression streamVisibility =
+                    (stream == AdvisoryPageCursor.Stream.ADVISORY) ? visibilityExpr : null;
+            Map<String, Object> selector = AdvisorySearchUtil.buildAdvisoryExpression(expression,
+                    objectTypeFor(stream), streamVisibility);
+            CouchDbService.PagedResult rawPage = this.couchDbService.findDocumentsPaged(selector,
+                    new ArrayList<>(advisoryReadFields().keySet()), limit + 1L, mangoBookmark);
+            List<JsonNode> rawRows = rawPage.rows();
+
+            for (int rawIndex = skipWithinPage; rawIndex < rawRows.size(); rawIndex++) {
+                AdvisoryInformationResponse response =
+                        AdvisoryWrapper.convertToAdvisoryInfo(rawRows.get(rawIndex), advisoryReadFields());
+                if (stream == AdvisoryPageCursor.Stream.ADVISORY) {
+                    enrichAdvisory(response, credentials);
+                } else {
+                    enrichAdvisoryVersion(response);
+                }
+                // Every raw row is already visible (visibility is enforced in the query), so emit it.
+                if (visible.size() == limit) {
+                    // This is the read-ahead row: more rows exist. Stop before it; the cursor already
+                    // points exactly after the last emitted row.
+                    return new AdvisoryInformationPageResponse(visible,
+                            new AdvisoryPageCursor(cursorMangoBookmark, cursorSkip, cursorStream, fingerprint)
+                                    .encode(),
+                            true, limit);
+                }
+                visible.add(response);
+                // Remember the position right after this emitted row for the next cursor.
+                cursorStream = stream;
+                cursorMangoBookmark = mangoBookmark;
+                cursorSkip = rawIndex + 1;
+            }
+
+            boolean rawPageExhausted = rawRows.size() < limit + 1;
+            // Move to the next raw page within the current stream.
+            mangoBookmark = rawPage.bookmark();
+            skipWithinPage = 0;
+            if (rawPageExhausted) {
+                if (stream == AdvisoryPageCursor.Stream.ADVISORY && isAuditor) {
+                    // Switch to the advisory-version stream and continue from its beginning.
+                    stream = AdvisoryPageCursor.Stream.ADVISORY_VERSION;
+                    mangoBookmark = null;
+                    cursorStream = stream;
+                    cursorMangoBookmark = null;
+                    cursorSkip = 0;
+                } else {
+                    // No more raw rows in any stream: this is the last page.
+                    return new AdvisoryInformationPageResponse(visible, null, false, limit);
+                }
+            }
+        }
+        // Unreachable: the loop returns on read-ahead or exhaustion.
+        return new AdvisoryInformationPageResponse(visible, null, false, limit);
+    }
+
+    private static ObjectType objectTypeFor(AdvisoryPageCursor.Stream stream) {
+        return (stream == AdvisoryPageCursor.Stream.ADVISORY_VERSION)
+                ? ObjectType.AdvisoryVersion : ObjectType.Advisory;
+    }
+
+    private List<AdvisoryInformationResponse> readAllAdvisories(String expression, ObjectType objectType,
+                                                                Expression visibilityExpr)
+            throws CsafException, IOException {
 
         Map<DbField, BiConsumer<AdvisoryInformationResponse, String>> infoFields = AdvisoryWorkflowUtil.advisoryReadFields();
-        Map<String, Object> selector = AdvisorySearchUtil.buildAdvisoryExpression(expression, objectType);
+        Map<String, Object> selector = AdvisorySearchUtil.buildAdvisoryExpression(expression, objectType, visibilityExpr);
         List<JsonNode> docList = this.findDocuments(selector, new ArrayList<>(infoFields.keySet()));
         return docList.stream()
                 .map(couchDbDoc -> AdvisoryWrapper.convertToAdvisoryInfo(couchDbDoc, infoFields))
