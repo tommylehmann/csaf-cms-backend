@@ -616,10 +616,29 @@ public class AdvisoryService {
                 createReleaseReadyAdvisoryAndValidate(existingAdvisoryNode, proposedTime);
             }
 
+            // Reserve the FINAL tracking-id number at the first Draft-to-Review transition.
+            // Guard on the server-owned reservedTrackingNumber field (null == not yet reserved),
+            // not the client-controllable tracking id string: an editor could resubmit a CSAF
+            // document with an id containing "-TEMP-" to force an additional counter draw
+            // (security review finding F2 / CWE-807).
+            if (newWorkflowState == WorkflowState.Review
+                    && existingAdvisoryNode.getLastMajorVersion() < 1
+                    && existingAdvisoryNode.getReservedTrackingNumber() == null) {
+                reserveTrackingIdNumber(existingAdvisoryNode);
+            }
+
             if (newWorkflowState == WorkflowState.Published) {
                 existingAdvisoryNode = createReleaseReadyAdvisoryAndValidate(existingAdvisoryNode, proposedTime);
                 if (existingAdvisoryNode.getLastMajorVersion() < 1) {
-                    setFinalTrackingIdAndUrl(existingAdvisoryNode);
+                    if (existingAdvisoryNode.getReservedTrackingNumber() != null) {
+                        // Number was reserved at first review — reuse it, recompute year, add URL.
+                        existingAdvisoryNode.addSelfReferenceUrlAndFinalizeYear(
+                                this.referencesBaseUrl, this.trackingidCompany, this.trackingidDigits);
+                    } else {
+                        // Legacy fallback: advisory still holds a TEMP id at publish (predates
+                        // this feature). Draw a fresh FINAL number exactly as before.
+                        setFinalTrackingIdAndUrl(existingAdvisoryNode);
+                    }
                 }
             }
 
@@ -639,7 +658,25 @@ public class AdvisoryService {
     }
 
     /**
-     * Set the final tracking id in the advisory and a DocumentReferencesNode with the url of the tracking id
+     * Reserve the sequential number from the FINAL counter at first Draft-to-Review.
+     * Draws the next counter value and calls
+     * {@link AdvisoryWrapper#assignReservedTrackingId} to stash the old TEMP id,
+     * set the final-form id (with review-year placeholder), and persist the number.
+     *
+     * @param advisoryNode the advisory being transitioned to Review
+     * @throws CsafException error drawing the counter
+     */
+    void reserveTrackingIdNumber(AdvisoryWrapper advisoryNode) throws CsafException {
+
+        final long sequentialNumber = getNewTrackingIdCounter(TrackingIdCounter.FINAL_OBJECT_ID);
+        advisoryNode.assignReservedTrackingId(this.trackingidCompany, this.trackingidDigits, sequentialNumber);
+    }
+
+    /**
+     * Legacy fallback: draw a fresh number from the FINAL counter and set the final
+     * tracking id and self-reference URL in a single step. Used only when an advisory
+     * reaches Publish still holding a temporary id (no reserved number — created before
+     * this feature was deployed).
      *
      * @param advisoryNode the node to set the tracking id
      * @throws CsafException error creating counter
@@ -647,7 +684,7 @@ public class AdvisoryService {
     void setFinalTrackingIdAndUrl(AdvisoryWrapper advisoryNode) throws CsafException {
 
         final long sequentialNumber = getNewTrackingIdCounter(TrackingIdCounter.FINAL_OBJECT_ID);
-        advisoryNode.setFinalTrackingIdAndUrl(this.referencesBaseUrl, this.trackingidCompany, this.trackingidDigits, sequentialNumber);
+        advisoryNode.drawAndAssignFinalTrackingIdAndUrl(this.referencesBaseUrl, this.trackingidCompany, this.trackingidDigits, sequentialNumber);
     }
 
 
